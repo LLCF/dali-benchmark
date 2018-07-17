@@ -1,7 +1,7 @@
 import os
 
 
-cmdline = "python train_imagenet.py --gpu %s --batch-size %d --num-epochs 1 --data-train /data/imagenet/train-480-val-256-recordio/train.rec --data-val /data/imagenet/train-480-val-256-recordio/val.rec --disp-batches 100 --network resnet-v1 --num-layers 50 --data-nthreads 32 --min-random-scale 0.533 --max-random-shear-ratio 0 --max-random-rotate-angle 0 --max-random-h 0 --max-random-s 0 --max-random-l 0 "
+cmdline = "python ./mxnet-examples/train_imagenet.py --gpu %s --batch-size %d --num-epochs 1 --data-train /data/imagenet/train-480-val-256-recordio/train.rec --data-val /data/imagenet/train-480-val-256-recordio/val.rec --disp-batches 100 --network resnet-v1 --num-layers 50 --data-nthreads 32 --min-random-scale 0.533 --max-random-shear-ratio 0 --max-random-rotate-angle 0 --max-random-h 0 --max-random-s 0 --max-random-l 0 "
 
 
 fp16 = " --dtype float16 "
