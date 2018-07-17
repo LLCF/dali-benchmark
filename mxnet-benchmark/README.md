@@ -7,7 +7,11 @@ recognized object classes with corresponding probabilities using a pre-traind
 model.
 
 <img src="https://raw.githubusercontent.com/dmlc/web-data/master/mxnet/image/predict-dog.png" width="600"/>
+
+
 ## Add dali support
+
+
 ```
 python python train_imagenet.py --use-dali   ......
 ```
