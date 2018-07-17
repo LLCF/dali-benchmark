@@ -1,0 +1,739 @@
+import argparse
+import os
+import shutil
+import json
+import time
+
+import torch
+from torch.autograd import Variable
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.optim
+import torch.utils.data
+import resnet as resnet
+import torch.utils.data.distributed
+import resnet as resnet
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+import torchvision.models as models
+
+import numpy as np
+
+try:
+    from apex.parallel import DistributedDataParallel as DDP
+    from apex.fp16_utils import *
+except ImportError:
+    raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
+
+try:
+    from nvidia.dali.plugin.pytorch import DALIClassificationIterator
+    from nvidia.dali.pipeline import Pipeline
+    import nvidia.dali.ops as ops
+    import nvidia.dali.types as types
+except ImportError:
+    raise ImportError("Please install dali from https://www.github.com/nvidia/dali to run this example.")
+
+
+#Dali based pipeline for imagenet, assuems c2 based lmdb:
+class HybridPipe(Pipeline):
+    def __init__(self, batch_size, num_threads, device_id, data_dir):
+        super(HybridPipe, self).__init__(batch_size,
+                                         num_threads,
+                                         device_id)
+        self.input = ops.FileReader(file_root  = data_dir, random_shuffle = True, initial_fill = 21)
+        self.decode= ops.nvJPEGDecoder(device = "mixed", output_type = types.RGB)
+        self.rrc = ops.RandomResizedCrop(device = "gpu", size = (224, 224))
+        self.cmnp = ops.CropMirrorNormalize(device = "gpu",
+                                            output_dtype = types.FLOAT,
+                                            output_layout = types.NCHW,
+                                            image_type = types.RGB,
+                                            crop = (224, 224),
+                                            mean = [0.485 * 255, 0.456 * 255, 0.406 * 255],
+                                            std = [0.229 * 255, 0.224 * 255, 0.225 * 255])
+
+        self.coin = ops.CoinFlip(probability = 0.5)
+    
+    def define_graph(self):
+        rng = self.coin()
+        self.jpegs, self.labels = self.input(name="Reader")
+        images = self.decode(self.jpegs)
+        images = self.rrc(images)
+        output = self.cmnp(images, mirror = rng)
+        return [output, self.labels]
+
+    def iter_setup(self):
+        pass
+
+model_names = sorted(name for name in models.__dict__
+                     if name.islower() and not name.startswith("__")
+                     and callable(models.__dict__[name]))
+
+parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+parser.add_argument('--iterations', default=0, type=int, metavar='N',
+                    help='Number of iterations to run per epoch')
+parser.add_argument('--ref', type=str, default=None,
+                    help='path to json file with performance reference')
+parser.add_argument('--create_reference', type=bool, default=False,
+                    help='if true, will create json file with reference perf values under --ref file')
+parser.add_argument('data', metavar='DIR',
+                    help='path to dataset')
+parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet18',
+                    choices=model_names,
+                    help='model architecture: ' +
+                    ' | '.join(model_names) +
+                    ' (default: resnet18)')
+parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+                    help='number of data loading workers (default: 4)')
+parser.add_argument('--epochs', default=90, type=int, metavar='N',
+                    help='number of total epochs to run')
+parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+                    help='manual epoch number (useful on restarts)')
+parser.add_argument('-b', '--batch-size', default=256, type=int,
+                    metavar='N', help='mini-batch size (default: 256)')
+parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+                    metavar='LR', help='initial learning rate')
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+                    help='momentum')
+parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
+                    metavar='W', help='weight decay (default: 1e-4)')
+parser.add_argument('--print-freq', '-p', default=10, type=int,
+                    metavar='N', help='print frequency (default: 10)')
+parser.add_argument('--resume', default='', type=str, metavar='PATH',
+                    help='path to latest checkpoint (default: none)')
+parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
+                    help='evaluate model on validation set')
+parser.add_argument('--pretrained', dest='pretrained', action='store_true',
+                    help='use pre-trained model')
+
+parser.add_argument('--fp16', action='store_true',
+                    help='Run model fp16 mode.')
+parser.add_argument('--static-loss-scale', type=float, default=1,
+                    help='Static loss scale, positive power of 2 values can improve fp16 convergence.')
+parser.add_argument('--prof', dest='prof', action='store_true',
+                    help='Only run 10 iterations for profiling.')
+
+parser.add_argument('--dist-url', default='file://sync.file', type=str,
+                    help='url used to set up distributed training')
+parser.add_argument('--dist-backend', default='nccl', type=str,
+                    help='distributed backend')
+parser.add_argument('--loss-scale', type=float, default=1,
+                    help='Loss scaling, positive power of 2 values can improve fp16 convergence.')
+parser.add_argument('--world-size', default=1, type=int,
+                    help='Number of GPUs to use. Can either be manually set ' +
+                    'or automatically set by using \'python -m multiproc\'.')
+parser.add_argument('--rank', default=0, type=int,
+                    help='Used for multi-process training. Can either be manually set ' +
+                    'or automatically set by using \'python -m multiproc\'.')
+
+parser.add_argument('--use-dali', action='store_true',
+                     help='Enable dali')
+
+cudnn.benchmark = True
+
+
+
+def fast_collate(batch):
+    imgs = [img[0] for img in batch]
+    targets = torch.tensor([target[1] for target in batch], dtype=torch.int64)
+    w = imgs[0].size[0]
+    h = imgs[0].size[1]
+    tensor = torch.zeros( (len(imgs), 3, h, w), dtype=torch.uint8 )
+    for i, img in enumerate(imgs):
+        nump_array = np.asarray(img, dtype=np.uint8)
+        tens = torch.from_numpy(nump_array)
+        if(nump_array.ndim < 3):
+            nump_array = np.expand_dims(nump_array, axis=-1)
+        nump_array = np.rollaxis(nump_array, 2)
+
+        tensor[i] += torch.from_numpy(nump_array)
+        
+    return tensor, targets
+
+best_prec1 = 0
+args = parser.parse_args()
+
+def main():
+    global best_prec1, args
+
+    args.distributed = args.world_size > 1
+    args.gpu = 0
+    if args.distributed:
+        args.gpu = args.rank % torch.cuda.device_count()
+        
+
+    if args.distributed:
+        torch.cuda.set_device(args.gpu)
+        dist.init_process_group(backend=args.dist_backend, 
+                                init_method=args.dist_url,
+                                world_size=args.world_size,
+                                rank=args.rank)
+
+    if args.fp16:
+        assert torch.backends.cudnn.enabled, "fp16 mode requires cudnn backend to be enabled."
+
+    # create model
+    if args.pretrained:
+        print("=> using pre-trained model '{}'".format(args.arch))
+        model = models.__dict__[args.arch](pretrained=True)
+    else:
+        print("=> creating model '{}'".format(args.arch))
+        model = resnet.__dict__[args.arch]()
+
+    model = model.cuda()
+    if args.fp16:
+        model = network_to_half(model)
+    if args.distributed:
+        #shared param turns off bucketing in DDP, for lower latency runs this can improve perf
+        model = DDP(model, shared_param=True)
+
+    global model_params, master_params
+    if args.fp16:
+        model_params, master_params = prep_param_lists(model)
+    else:
+        master_params = list(model.parameters())
+
+    # define loss function (criterion) and optimizer
+    criterion = nn.CrossEntropyLoss().cuda()
+
+    optimizer = torch.optim.SGD(master_params, args.lr,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
+
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume, map_location = lambda storage, loc: storage.cuda(args.gpu))
+            args.start_epoch = checkpoint['epoch']
+            best_prec1 = checkpoint['best_prec1']
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+
+    # Data loading code
+    traindir = os.path.join(args.data, 'train')
+    valdir = os.path.join(args.data, 'val')
+
+    if(args.arch == "inception_v3"):
+        crop_size = 299
+        val_size = 320 # I chose this value arbitrarily, we can adjust.
+    else:
+        crop_size = 224
+        val_size = 256
+
+
+    train_sampler = None
+    if args.use_dali == True:
+        traindir = os.path.join(args.data, 'train')
+        valdir = os.path.join(args.data, 'val')
+        
+        pipe = HybridPipe(batch_size=args.batch_size, num_threads=args.workers, device_id = args.rank, data_dir = traindir)
+        print("")
+        print("batchsize:%s, num_threads:%s, device_id:%s, data_dir:%s"%(args.batch_size, args.workers, args.rank, traindir))
+        print("")
+        pipe.build()
+        test_run = pipe.run() 
+       
+        
+        from nvidia.dali.plugin.pytorch import DALIClassificationIterator
+        train_loader = DALIClassificationIterator(pipe, size = int(1281167 / args.world_size) )
+       
+        pipe = HybridPipe(batch_size=args.batch_size, num_threads=args.workers, device_id = args.rank, data_dir = valdir)
+        pipe.build()
+        test_run = pipe.run()
+        from nvidia.dali.plugin.pytorch import DALIClassificationIterator
+        val_loader = DALIClassificationIterator(pipe, size = int(50000 / args.world_size) )
+
+    else:
+        train_dataset = datasets.ImageFolder(
+            traindir,
+            transforms.Compose([
+                transforms.RandomResizedCrop(crop_size),
+                transforms.RandomHorizontalFlip(),
+                # transforms.ToTensor(), Too slow
+                # normalize,
+            ]))
+        
+        if args.distributed:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+            num_workers=args.workers, pin_memory=True, sampler=train_sampler, collate_fn=fast_collate)
+
+        val_loader = torch.utils.data.DataLoader(
+            datasets.ImageFolder(valdir, transforms.Compose([
+                transforms.Resize(val_size),
+                transforms.CenterCrop(crop_size),
+            ])),
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True,
+            collate_fn=fast_collate)
+
+    if args.evaluate:
+        if args.use_dali == False:
+            validate(val_loader, model, criterion, args.iterations)
+        else:
+            validate(val_loader, model, criterion)
+        return
+
+    avgBatchTime = 0
+
+    for epoch in range(args.start_epoch, args.epochs):
+        if args.use_dali == False and args.distributed:
+            train_sampler.set_epoch(epoch)
+        adjust_learning_rate(optimizer, epoch)
+
+        # train for one epoch
+        if args.use_dali:
+            avgBatchTime = max(avgBatchTime, train_enable_dali(train_loader, model, criterion, optimizer, epoch))
+        else:
+            avgBatchTime = max(avgBatchTime, train_disable_dali(train_loader, model, criterion, optimizer, epoch, args.iterations))
+        if args.prof:
+            break
+        # evaluate on validation set
+        if args.use_dali == False:
+            prec1 = validate_disable_dali(val_loader, model, criterion, args.iterations)
+        else:
+            prec1 = validate_enable_dali(val_loader, model, criterion)
+
+
+        if args.use_dali == True:
+            train_loader.reset()
+            val_loader.reset()
+
+
+    imagesPerSecond = int(args.batch_size * args.world_size / avgBatchTime)
+    print("##### {}".format(imagesPerSecond))
+    if args.ref is not None:
+        data="{}"
+        if os.path.isfile(args.ref):
+            with open(args.ref, 'r') as f:
+                data = f.read()
+
+        ref = json.loads(data)
+
+        if args.create_reference:
+            cdc = str(torch.cuda.device_count())
+            bs = str(args.batch_size)
+            if cdc not in ref.keys():
+                ref[cdc] = {}
+            if bs not in ref[cdc].keys():
+                ref[cdc][bs]={}
+            ref[cdc][bs][args.arch]=imagesPerSecond
+            with open(args.ref, 'w') as rf:
+                json.dump(ref, rf)
+        else:
+            try:
+                total_batch = torch.cuda.device_count()*args.batch_size
+                baseline = ref[str(torch.cuda.device_count())][str(total_batch)][args.arch]
+                if imagesPerSecond < baseline * 0.9:
+                    print("REGRESSION: {} current average mbs < 90% of baseline mbs ({} mbs)".format(imagesPerSecond, baseline))
+            except KeyError as _:
+                pass
+
+class data_prefetcher():
+    def __init__(self, loader):
+        self.loader = iter(loader)
+        self.stream = torch.cuda.Stream()
+        self.mean = torch.tensor([0.485 * 255, 0.456 * 255, 0.406 * 255]).cuda().view(1,3,1,1)
+        self.std = torch.tensor([0.229 * 255, 0.224 * 255, 0.225 * 255]).cuda().view(1,3,1,1)
+        if args.fp16:
+            self.mean = self.mean.half()
+            self.std = self.std.half()
+        self.preload()
+
+    def preload(self):
+        try:
+            self.next_input, self.next_target = next(self.loader)
+        except StopIteration:
+            self.next_input = None
+            self.next_target = None
+            return
+        with torch.cuda.stream(self.stream):
+            self.next_input = self.next_input.cuda(async=True)
+            self.next_target = self.next_target.cuda(async=True)
+            if args.fp16:
+                self.next_input = self.next_input.half()
+            else:
+                self.next_input = self.next_input.float()
+            self.next_input = self.next_input.sub_(self.mean).div_(self.std)
+            
+    def next(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        input = self.next_input
+        target = self.next_target
+        self.preload()
+        return input, target
+
+
+
+def train_enable_dali(train_loader, model, criterion, optimizer, epoch):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    # switch to train mode
+    model.train()
+    end = time.time()
+
+    for i, data in enumerate(train_loader):
+        if i>100 and args.prof:
+            break
+
+        input = data[0][0][0]
+        target = data[0][1][0].cuda().long()
+
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        input_var = Variable(input)
+        target_var = Variable(target)
+
+        # compute output
+        output = model(input_var)
+        loss = criterion(output, target_var)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+
+        if args.distributed:
+            reduced_loss = reduce_tensor(loss.data)
+            prec1 = reduce_tensor(prec1)
+            prec5 = reduce_tensor(prec5)
+        else:
+            reduced_loss = loss.data
+
+        losses.update(to_python_float(reduced_loss), input.size(0))
+        top1.update(to_python_float(prec1), input.size(0))
+        top5.update(to_python_float(prec5), input.size(0))
+
+        loss = loss*args.loss_scale
+        # compute gradient and do SGD step
+        if args.fp16:
+            model.zero_grad()
+            loss.backward()
+            model_grads_to_master_grads(model_params, master_params)
+            if args.loss_scale != 1:
+                for param in master_params:
+                    param.grad.data = param.grad.data/args.loss_scale
+            optimizer.step()
+            master_params_to_model_params(model_params, master_params)
+        else:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+
+        end = time.time()
+        '''
+        if args.rank == 0 and i % args.print_freq == 0 and i > 1:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                   epoch, i, int(train_loader._size/args.batch_size), batch_time=batch_time,
+                   data_time=data_time, loss=losses, top1=top1, top5=top5))'''
+        if args.rank == 0 and i % args.print_freq == 0:
+            print('Test: [{0}/{1}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Speed {2:.3f} ({3:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                   i, int(train_loader._size/args.batch_size),
+                   args.world_size * args.batch_size / batch_time.val,
+                   args.world_size * args.batch_size / batch_time.avg,
+                   batch_time=batch_time, loss=losses,
+                   top1=top1, top5=top5))
+    return batch_time.avg
+
+
+def train_disable_dali(train_loader, model, criterion, optimizer, epoch, iterations):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    # switch to train mode
+    model.train()
+    end = time.time()
+
+    prefetcher = data_prefetcher(train_loader)
+    input, target = prefetcher.next()
+    i = -1
+    while input is not None:
+        i += 1
+
+        if args.prof:
+            if i > 100:
+                break
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        input_var = Variable(input)
+        target_var = Variable(target)
+
+        # compute output
+        output = model(input_var)
+        loss = criterion(output, target_var)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+
+        if args.distributed:
+            reduced_loss = reduce_tensor(loss.data)
+            prec1 = reduce_tensor(prec1)
+            prec5 = reduce_tensor(prec5)
+        else:
+            reduced_loss = loss.data
+
+        losses.update(to_python_float(reduced_loss), input.size(0))
+        top1.update(to_python_float(prec1), input.size(0))
+        top5.update(to_python_float(prec5), input.size(0))
+
+        loss = loss*args.static_loss_scale
+        # compute gradient and do SGD step
+        if args.fp16:
+            model.zero_grad()
+            loss.backward()
+            model_grads_to_master_grads(model_params, master_params)
+            if args.static_loss_scale != 1:
+                for param in master_params:
+                    param.grad.data = param.grad.data/args.static_loss_scale
+            optimizer.step()
+            master_params_to_model_params(model_params, master_params)
+        else:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        torch.cuda.synchronize()
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+
+        end = time.time()
+
+        if i == 0:
+            batch_time.reset()
+        if (iterations != 0) and (iterations < i):
+            break;
+        input, target = prefetcher.next()
+
+        if args.rank == 0 and i % args.print_freq == 0 and i > 1:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Speed {3:.3f} ({4:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                   epoch, i, len(train_loader),
+                   args.world_size * args.batch_size / batch_time.val,
+                   args.world_size * args.batch_size / batch_time.avg,
+                   batch_time=batch_time,
+                   data_time=data_time, loss=losses, top1=top1, top5=top5))
+
+    return batch_time.avg
+
+
+def validate_enable_dali(val_loader, model, criterion):
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
+
+    end = time.time()
+
+    for i, data in enumerate(val_loader):
+        input = data[0][0][0]
+        target = data[0][1][0].cuda().long()
+        input_var = Variable(input)
+        target_var = Variable(target)
+
+        # compute output
+        with torch.no_grad():
+            output = model(input_var)
+            loss = criterion(output, target_var)
+
+        reduced_loss = reduce_tensor(loss.data)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+
+        reduced_prec1 = reduce_tensor(prec1)
+        reduced_prec5 = reduce_tensor(prec5)
+
+        losses.update(to_python_float(reduced_loss), input.size(0))
+        top1.update(to_python_float(prec1), input.size(0))
+        top5.update(to_python_float(prec5), input.size(0))
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+        '''
+        if args.rank == 0 and i % args.print_freq == 0:
+            print('Test: [{0}/{1}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                   i, int(val_loader._size/args.batch_size), batch_time=batch_time, loss=losses,
+                   top1=top1, top5=top5))
+        '''
+        if args.rank == 0 and i % args.print_freq == 0:
+            print('Test: [{0}/{1}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Speed {2:.3f} ({3:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                   i, len(val_loader),
+                   args.world_size * args.batch_size / batch_time.val,
+                   args.world_size * args.batch_size / batch_time.avg,
+                   batch_time=batch_time, loss=losses,
+                   top1=top1, top5=top5))
+
+    print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
+          .format(top1=top1, top5=top5))
+
+    return top1.avg
+
+def validate_disable_dali(val_loader, model, criterion, iterations):
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
+
+    if iterations != 0:
+        return top1.avg;
+
+
+    end = time.time()
+
+    prefetcher = data_prefetcher(val_loader)
+    input, target = prefetcher.next()
+    i = -1
+    while input is not None:
+        i += 1
+
+        target = target.cuda(async=True)
+        input_var = Variable(input)
+        target_var = Variable(target)
+
+        # compute output
+        with torch.no_grad():
+            output = model(input_var)
+            loss = criterion(output, target_var)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+
+        if args.distributed:
+            reduced_loss = reduce_tensor(loss.data)
+            prec1 = reduce_tensor(prec1)
+            prec5 = reduce_tensor(prec5)
+        else:
+            reduced_loss = loss.data
+
+        losses.update(to_python_float(reduced_loss), input.size(0))
+        top1.update(to_python_float(prec1), input.size(0))
+        top5.update(to_python_float(prec5), input.size(0))
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if args.rank == 0 and i % args.print_freq == 0:
+            print('Test: [{0}/{1}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Speed {2:.3f} ({3:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                   i, len(val_loader),
+                   args.world_size * args.batch_size / batch_time.val,
+                   args.world_size * args.batch_size / batch_time.avg,
+                   batch_time=batch_time, loss=losses,
+                   top1=top1, top5=top5))
+
+        input, target = prefetcher.next()
+
+    print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
+          .format(top1=top1, top5=top5))
+
+    return top1.avg
+
+
+def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, 'model_best.pth.tar')
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def adjust_learning_rate(optimizer, epoch):
+    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+    lr = args.lr * (0.1 ** (epoch // 30))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
+
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+
+def reduce_tensor(tensor):
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.reduce_op.SUM)
+    rt /= args.world_size
+    return rt
+
+if __name__ == '__main__':
+    main()
