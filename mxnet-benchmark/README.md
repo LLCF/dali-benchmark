@@ -7,6 +7,11 @@ recognized object classes with corresponding probabilities using a pre-traind
 model.
 
 <img src="https://raw.githubusercontent.com/dmlc/web-data/master/mxnet/image/predict-dog.png" width="600"/>
+## Add dali support
+```
+python python train_imagenet.py --use-dali   ......
+```
+
 
 ## Contents
 
@@ -19,8 +24,7 @@ model.
 
 ## Basic Usages
 
-Both python and R training programs are provided. Use `train_*.py` or
-`train_*.R` to train a network on a particular dataset. For example:
+Python training programs are provided. Use `train_*.py` to train a network on a particular dataset. For example:
 
 - train a multilayer perception on the mnist dataset
 
