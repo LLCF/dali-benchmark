@@ -1,14 +1,13 @@
 import os
 
 
-cmdline = "python -m apex.parallel.multiproc perf.py -a resnet50 -b %s --world-size %s --epochs=1 --iterations=100 -j 5 -p 10 --dist-backend nccl ./ "
+cmdline = "python -m apex.parallel.multiproc pytorch-examples/perf.py -a resnet50 -b %s --world-size %s --epochs=1 --iterations=100 -j 5 -p 10 --dist-backend nccl ./ "
 
 
 fp16 = " --fp16 "
 
 for fp in ["fp16", "fp32"]:
-    for gpu in range(4,5):
-        #gpus = "".join(str(list(range(gpu)))).replace("[", "").replace("]", "").replace(" ", "")
+    for gpu in range(1,5):
         if fp == "fp16":
             cmd = cmdline%(128, gpu)
             cmd += fp16
