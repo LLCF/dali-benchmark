@@ -1,7 +1,7 @@
 import os
 
 
-cmdline = "python -m apex.parallel.multiproc pytorch-examples/perf.py -a resnet50 -b %s --world-size %s --epochs=1 --iterations=100 -j 5 -p 10 --dist-backend nccl ./ "
+cmdline = "python -m apex.parallel.multiproc pytorch-examples/perf.py -a resnet50 --prof -b %s --world-size %s --epochs=1 --iterations=100 -j 5 -p 10 --dist-backend nccl ./ "
 
 
 fp16 = " --fp16 "
